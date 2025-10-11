@@ -5,18 +5,37 @@ from urllib.parse import quote
 import json
 import re
 import httpx
-import math
 
 # --- Configuration ---
 BASE_URL = "https://www.animeunity.so"
 
 app = FastAPI(
     title="AnimeUnity API Proxy",
-    description="API to interact with AnimeUnity based on provided internal data structure.",
+    description="API to interact with AnimeUnity using fresh sessions to handle cookies and Cloudflare.",
     version="1.0.0"
 )
 
 # --- Helper Functions ---
+
+def get_session_with_cookies() -> requests.Session:
+    """
+    Create a requests session and hit the base URL to get initial cookies from AnimeUnity.
+    Returns a session with cookies set.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                  "application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
+    # First request to base URL to get cookies
+    session.get(BASE_URL)
+    return session
 
 def extract_json_from_html(html_content: str) -> list:
     try:
@@ -49,10 +68,13 @@ async def search_anime(title: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Title query must be provided."
         )
+
     safe_title = quote(title)
     search_url = f"{BASE_URL}/archivio?title={safe_title}"
+
+    session = get_session_with_cookies()  # Get fresh session + cookies
     try:
-        response = requests.get(search_url)
+        response = session.get(search_url)
         response.raise_for_status()
         anime_records = extract_json_from_html(response.text)
         cleaned_records = []
@@ -86,16 +108,17 @@ async def search_anime(title: str):
 
 @app.get("/episodes", summary="Get a list of episodes for a specific anime ID")
 async def get_episodes(anime_id: int):
+    session = get_session_with_cookies()
     info_url = f"{BASE_URL}/info_api/{anime_id}/0"
     try:
-        info_response = requests.get(info_url)
+        info_response = session.get(info_url)
         info_response.raise_for_status()
         info_data = info_response.json()
         episodes_count = info_data.get("episodes_count", 0)
         if episodes_count == 0:
             return {"anime_id": anime_id, "episodes_count": 0, "episodes": []}
         fetch_url = f"{info_url}?start_range=0&end_range={min(episodes_count, 120)}"
-        episodes_response = requests.get(fetch_url)
+        episodes_response = session.get(fetch_url)
         episodes_response.raise_for_status()
         episodes_data = episodes_response.json()
         cleaned_episodes = []
@@ -131,9 +154,10 @@ async def get_episodes(anime_id: int):
 
 @app.get("/stream", summary="Get the direct video file URL for an episode ID")
 async def get_stream_url(episode_id: int):
+    session = get_session_with_cookies()
     embed_url_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
     try:
-        embed_response = requests.get(embed_url_endpoint, allow_redirects=False)
+        embed_response = session.get(embed_url_endpoint, allow_redirects=False)
         embed_response.raise_for_status()
         if embed_response.status_code == 302:
             embed_target_url = embed_response.headers.get("Location")
@@ -143,7 +167,7 @@ async def get_stream_url(episode_id: int):
                 raise ValueError("Could not find a valid embed URL.")
         if not embed_target_url:
             raise ValueError("Could not find embed URL in response.")
-        video_page_response = requests.get(embed_target_url)
+        video_page_response = session.get(embed_target_url)
         video_page_response.raise_for_status()
         video_download_url = extract_video_url_from_embed_html(video_page_response.text)
         if not video_download_url:
@@ -172,10 +196,8 @@ async def get_stream_url(episode_id: int):
             detail=f"An unexpected error occurred: {e}"
         )
 
-# --- Stream video with proper Range support ---
 @app.get("/stream_video", summary="Stream the video file for an episode ID")
 async def stream_video(request: Request, episode_id: int):
-    # Step 1: Get fresh stream URL
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             resp = await client.get(f"http://127.0.0.1:8000/stream?episode_id={episode_id}")
@@ -187,7 +209,6 @@ async def stream_video(request: Request, episode_id: int):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to get fresh stream URL: {e}")
 
-    # Step 2: Parse Range header for HTML5 video seeking
     range_header = request.headers.get("range")
     range_start = 0
     range_end = None
@@ -207,7 +228,6 @@ async def stream_video(request: Request, episode_id: int):
                 async for chunk in video_resp.aiter_bytes(1024 * 1024):
                     yield chunk
 
-    # Step 3: Fetch content length to calculate Content-Range if possible
     content_length = None
     async with httpx.AsyncClient(timeout=None) as client:
         head_resp = await client.head(stream_url)
