@@ -35,8 +35,8 @@ Streams the video directly to the browser. Supports HTML5 `<video>` seeking.
 
 1. Clone the repository:
 ```
-git clone <repo-url>
-cd <repo-folder>
+git clone https://github.com/Pal-droid/Animeunity-API
+cd Animeunity-API
 ```
 
 2. Install dependencies:
