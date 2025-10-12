@@ -46,7 +46,7 @@ pip install -r requirements.txt
 
 3. Run the API:
 ```
-uvicorn anime_api:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 4. Access endpoints via:  
