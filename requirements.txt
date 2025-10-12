@@ -2,3 +2,4 @@ fastapi==0.111.0
 uvicorn[standard]
 requests==2.32.0
 httpx
+aiofiles
