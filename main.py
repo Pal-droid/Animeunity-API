@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse
 from urllib.parse import quote
 import requests
@@ -7,25 +7,17 @@ import asyncio
 import json
 import re
 import time
-import aiofiles
-import os
-import hashlib
 
 # --- Configuration ---
 BASE_URL = "https://www.animeunity.so"
-CACHE_TTL = 300  # 5 minutes for stream URLs
-CACHE_VIDEO_TTL = 60 * 20  # 20 minutes for video segments
+CACHE_TTL = 300  # seconds (5 minutes)
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retries
-CACHE_VIDEO_DIR = "video_cache"
-
-# Ensure cache directory exists
-os.makedirs(CACHE_VIDEO_DIR, exist_ok=True)
 
 app = FastAPI(
     title="AnimeUnity API Proxy",
-    description="API to interact with AnimeUnity using fresh sessions and local caching for streams.",
-    version="1.2.0"
+    description="API to interact with AnimeUnity using fresh sessions to handle cookies and Cloudflare.",
+    version="1.1.0"
 )
 
 # --- Global cache + shared HTTP client ---
@@ -33,14 +25,11 @@ stream_cache = {}  # {episode_id: {"url": str, "timestamp": float}}
 shared_client: httpx.AsyncClient | None = None
 
 
-# --- Startup & Cleanup ---
-
 @app.on_event("startup")
 async def startup_event():
     global shared_client
     shared_client = httpx.AsyncClient(timeout=None)
     print("✅ Shared HTTP client initialized")
-    asyncio.create_task(cleanup_video_cache())
 
 
 @app.on_event("shutdown")
@@ -51,7 +40,7 @@ async def shutdown_event():
         print("🧹 Shared HTTP client closed")
 
 
-# --- Utility Functions ---
+# --- Helper Functions ---
 
 def get_session_with_cookies() -> requests.Session:
     """Create a requests session and hit the base URL to get initial cookies."""
@@ -103,28 +92,6 @@ async def retry_request(fn, *args, **kwargs):
                 raise
             print(f"⚠️ Retry {attempt}/{MAX_RETRIES} after error: {e}")
             await asyncio.sleep(RETRY_DELAY)
-
-
-def make_cache_path(episode_id: int, range_start: int, range_end: int | None):
-    """Generate unique cache file path for a specific byte range."""
-    key = f"{episode_id}-{range_start}-{range_end or 'end'}"
-    filename = hashlib.sha1(key.encode()).hexdigest() + ".part"
-    return os.path.join(CACHE_VIDEO_DIR, filename)
-
-
-async def cleanup_video_cache():
-    """Removes old video cache files."""
-    while True:
-        now = time.time()
-        for f in os.listdir(CACHE_VIDEO_DIR):
-            path = os.path.join(CACHE_VIDEO_DIR, f)
-            if os.path.isfile(path) and now - os.path.getmtime(path) > CACHE_VIDEO_TTL:
-                try:
-                    os.remove(path)
-                    print(f"🧹 Removed expired cache: {f}")
-                except:
-                    pass
-        await asyncio.sleep(300)  # every 5 minutes
 
 
 # --- API Endpoints ---
@@ -237,13 +204,13 @@ async def get_stream_url(episode_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stream_video", summary="Stream video file (with caching & retries)")
+@app.get("/stream_video", summary="Stream video file (with retries)")
 async def stream_video(request: Request, episode_id: int):
     global shared_client
     if not shared_client:
         raise HTTPException(status_code=500, detail="Shared HTTP client not initialized")
 
-    # Get stream URL
+    # Get stream URL (cached or fetched)
     try:
         resp = await retry_request(shared_client.get, f"http://127.0.0.1:8000/stream?episode_id={episode_id}")
         data = resp.json()
@@ -253,7 +220,7 @@ async def stream_video(request: Request, episode_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get stream URL: {e}")
 
-    # Handle range
+    # Handle range headers
     range_header = request.headers.get("range")
     range_start, range_end = 0, None
     if range_header:
@@ -262,34 +229,15 @@ async def stream_video(request: Request, episode_id: int):
             range_start = int(match.group(1))
             range_end = int(match.group(2) or 0) or None
 
-    cache_path = make_cache_path(episode_id, range_start, range_end)
-
-    # Serve from cache if available
-    if os.path.exists(cache_path):
-        async def cached_stream():
-            async with aiofiles.open(cache_path, "rb") as f:
-                while chunk := await f.read(1024 * 1024):
-                    yield chunk
-        print(f"🟢 Serving from cache: {cache_path}")
-        return StreamingResponse(
-            cached_stream(),
-            media_type="video/mp4",
-            status_code=206 if range_header else 200
-        )
-
-    # Otherwise stream from CDN and save to cache
     async def video_generator():
         headers = {"Range": f"bytes={range_start}-" if not range_end else f"bytes={range_start}-{range_end}"}
         async with shared_client.stream("GET", stream_url, headers=headers) as video_resp:
             if video_resp.status_code not in (200, 206):
                 raise HTTPException(status_code=video_resp.status_code, detail="Failed to fetch video")
+            async for chunk in video_resp.aiter_bytes(1024 * 1024):
+                yield chunk
 
-            async with aiofiles.open(cache_path, "wb") as cache_file:
-                async for chunk in video_resp.aiter_bytes(1024 * 1024):
-                    await cache_file.write(chunk)
-                    yield chunk
-
-    # Optional: get file size for headers
+    # Get file size (optional)
     head_resp = await retry_request(shared_client.head, stream_url)
     content_length = int(head_resp.headers.get("content-length", 0))
 
@@ -309,5 +257,4 @@ async def stream_video(request: Request, episode_id: int):
     else:
         status_code = 200
 
-    print(f"🔵 Fetching and caching: {cache_path}")
     return StreamingResponse(video_generator(), headers=headers_to_send, status_code=status_code)
