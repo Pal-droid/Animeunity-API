@@ -63,3 +63,7 @@ HTML5 video playback:
 ```
 
 The video will stream directly from the AnimeUnity source and supports seeking.
+
+# Notes
+
+For some reason in some deployed instances the API gets 403'd *(So far ive only seen it happen with [Render](render.com))*, im still looking into it, if you need it to work then a working service would be [Koyeb](koyeb.com)
