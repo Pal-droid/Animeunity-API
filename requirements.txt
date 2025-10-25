@@ -3,3 +3,4 @@ uvicorn[standard]
 requests==2.32.0
 httpx
 aiofiles
+bs4
