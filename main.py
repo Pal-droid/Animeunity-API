@@ -1,13 +1,12 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from urllib.parse import quote
-import requests
 import httpx
 import asyncio
 import json
 import re
 import time
-from bs4 import BeautifulSoup  # <-- NEW
+from bs4 import BeautifulSoup
 
 # --- Configuration ---
 BASE_URL = "https://www.animeunity.so"
@@ -17,8 +16,8 @@ RETRY_DELAY = 2
 
 app = FastAPI(
     title="AnimeUnity API Proxy",
-    description="API to interact with AnimeUnity using fresh sessions to handle cookies and Cloudflare.",
-    version="1.2.0"
+    description="Async API to interact with AnimeUnity using httpx and shared sessions.",
+    version="2.0.0"
 )
 
 # --- Global cache + shared HTTP client ---
@@ -29,24 +28,7 @@ shared_client: httpx.AsyncClient | None = None
 @app.on_event("startup")
 async def startup_event():
     global shared_client
-    shared_client = httpx.AsyncClient(timeout=None)
-    print("✅ Shared HTTP client initialized")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global shared_client
-    if shared_client:
-        await shared_client.aclose()
-        print("🧹 Shared HTTP client closed")
-
-
-# --- Helper Functions ---
-
-def get_session_with_cookies() -> requests.Session:
-    """Create a requests session and hit the base URL to get initial cookies."""
-    session = requests.Session()
-    session.headers.update({
+    headers = {
         "User-Agent": (
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
@@ -59,16 +41,24 @@ def get_session_with_cookies() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-    })
-    session.get(BASE_URL)
-    return session
+    }
 
+    shared_client = httpx.AsyncClient(headers=headers, timeout=None)
+    print("✅ Shared HTTP client initialized")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global shared_client
+    if shared_client:
+        await shared_client.aclose()
+        print("🧹 Shared HTTP client closed")
+
+
+# --- Helper functions ---
 
 def extract_json_from_html_with_thumbnails(html_content: str) -> list:
-    """
-    Extract JSON-like data from the <archivio> tag and clean custom escapes.
-    Returns a list of anime records (including image URLs).
-    """
+    """Extract JSON-like data from the <archivio> tag and clean custom escapes."""
     try:
         soup = BeautifulSoup(html_content, "html.parser")
         archivio_tag = soup.find("archivio")
@@ -81,20 +71,14 @@ def extract_json_from_html_with_thumbnails(html_content: str) -> list:
             print("⚠️ <archivio> tag found but missing 'records' attribute.")
             return []
 
-        # Clean AnimeUnity’s weird escape sequences
-        cleaned = records_string.replace(r'\="" \=""', r'\/')
-        cleaned = cleaned.replace('=""', r'\"')
-
-        # Parse JSON safely
-        data = json.loads(cleaned)
-        return data
+        cleaned = records_string.replace(r'\="" \=""', r'\/').replace('=""', r'\"')
+        return json.loads(cleaned)
     except Exception as e:
         print(f"❌ Error parsing anime records: {e}")
         return []
 
 
 def extract_video_url_from_embed_html(html_content: str) -> str | None:
-    """Extract the direct video URL from an embed page."""
     match = re.search(r"window\.downloadUrl\s*=\s*'([^']+)'", html_content)
     return match.group(1) if match else None
 
@@ -118,12 +102,12 @@ async def search_anime(title: str):
     if not title:
         raise HTTPException(status_code=400, detail="Title query must be provided.")
 
+    global shared_client
     safe_title = quote(title)
     search_url = f"{BASE_URL}/archivio?title={safe_title}"
-    session = get_session_with_cookies()
 
     try:
-        response = session.get(search_url)
+        response = await retry_request(shared_client.get, search_url)
         response.raise_for_status()
         anime_records = extract_json_from_html_with_thumbnails(response.text)
 
@@ -141,12 +125,12 @@ async def search_anime(title: str):
                 "slug": r.get("slug"),
                 "plot": (r.get("plot") or "").strip(),
                 "genres": [g.get("name") for g in r.get("genres", [])],
-                "thumbnail": r.get("imageurl"),  # ✅ NEW field
+                "thumbnail": r.get("imageurl"),
             }
             for r in anime_records
         ]
 
-    except requests.HTTPError as e:
+    except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -154,10 +138,11 @@ async def search_anime(title: str):
 
 @app.get("/episodes", summary="Get episodes for a specific anime ID")
 async def get_episodes(anime_id: int):
-    session = get_session_with_cookies()
+    global shared_client
     info_url = f"{BASE_URL}/info_api/{anime_id}/0"
+
     try:
-        info_response = session.get(info_url)
+        info_response = await retry_request(shared_client.get, info_url)
         info_response.raise_for_status()
         info_data = info_response.json()
         count = info_data.get("episodes_count", 0)
@@ -165,9 +150,10 @@ async def get_episodes(anime_id: int):
             return {"anime_id": anime_id, "episodes": []}
 
         fetch_url = f"{info_url}?start_range=0&end_range={min(count, 120)}"
-        episodes_response = session.get(fetch_url)
+        episodes_response = await retry_request(shared_client.get, fetch_url)
         episodes_response.raise_for_status()
         episodes_data = episodes_response.json()
+
         return {
             "anime_id": anime_id,
             "episodes": [
@@ -187,18 +173,19 @@ async def get_episodes(anime_id: int):
 
 @app.get("/stream", summary="Get direct video URL (cached & retried)")
 async def get_stream_url(episode_id: int):
+    global shared_client
     now = time.time()
 
     cached = stream_cache.get(episode_id)
     if cached and now - cached["timestamp"] < CACHE_TTL:
         return {"episode_id": episode_id, "stream_url": cached["url"], "cached": True}
 
-    session = get_session_with_cookies()
     embed_url_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
 
     try:
-        embed_response = session.get(embed_url_endpoint, allow_redirects=False)
+        embed_response = await retry_request(shared_client.get, embed_url_endpoint, follow_redirects=False)
         embed_response.raise_for_status()
+
         embed_target_url = (
             embed_response.headers.get("Location")
             if embed_response.status_code == 302
@@ -207,7 +194,7 @@ async def get_stream_url(episode_id: int):
         if not embed_target_url.startswith("http"):
             raise ValueError("Invalid embed URL")
 
-        video_page_response = session.get(embed_target_url)
+        video_page_response = await retry_request(shared_client.get, embed_target_url)
         video_page_response.raise_for_status()
         video_url = extract_video_url_from_embed_html(video_page_response.text)
         if not video_url:
@@ -216,7 +203,7 @@ async def get_stream_url(episode_id: int):
         stream_cache[episode_id] = {"url": video_url, "timestamp": now}
         return {"episode_id": episode_id, "stream_url": video_url, "cached": False}
 
-    except requests.HTTPError as e:
+    except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
