@@ -3,3 +3,4 @@ uvicorn[standard]
 httpx
 aiofiles
 bs4
+cloudscraper
