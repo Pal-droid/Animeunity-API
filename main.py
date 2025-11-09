@@ -1,263 +1,255 @@
 # main.py
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 import asyncio
 import json
 import re
 import time
 import cloudscraper
-from bs4 import BeautifulSoup
-from typing import Optional
-from contextlib import asynccontextmanager
+import httpx
+from typing import Optional, Dict, Any
 
 # --- Configuration ---
 BASE_URL = "https://www.animeunity.so"
-CACHE_TTL = 300
-USER_AGENT_DESKTOP = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/137.0.0.0 Safari/537.36"
-)
-USER_AGENT_MOBILE = (
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-)
+CACHE_TTL = 300  # seconds for stream URL cache
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds
 
-stream_cache = {}
+# App-global objects (initialized in lifespan)
 scraper: Optional[cloudscraper.CloudScraper] = None
-base_referer = BASE_URL
+last_referer: str = BASE_URL
+stream_cache: Dict[int, Dict[str, Any]] = {}
+httpx_client: Optional[httpx.AsyncClient] = None
+scraper_lock = asyncio.Lock()  # ensure only one thread does certain scraper startup tasks at once
 
-# --- Lifespan / startup handler to create cloudscraper instance ---
+
+# --- Lifespan (startup/shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scraper, base_referer
-    # Create a cloudscraper instance configured to mimic a mobile Chrome browser
+    global scraper, httpx_client, last_referer
+
+    # Create a persistent cloudscraper Session (synchronous)
+    # Choose a realistic mobile UA to match the site's expected UA (adjust if desired)
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "android", "mobile": True}
     )
 
-    # Set default headers on scraper (helps some checks)
-    scraper.headers.update({
-        "User-Agent": USER_AGENT_MOBILE,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        # Note: cloudscraper will handle other CF handshake bits
-    })
+    # Async httpx client used only for streaming video
+    httpx_client = httpx.AsyncClient(timeout=None)
 
-    # Try an initial GET to collect cookies and observe server response
+    # Try an initial request in a thread so cloudflare handshake may be established early.
+    # If it returns a JS challenge page (403), cloudscraper will attempt to resolve it on subsequent calls.
+    loop = asyncio.get_running_loop()
     try:
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, lambda: scraper.get(BASE_URL, timeout=20))
-        if resp.status_code == 403:
-            print(f"❌ Initial fetch returned 403 for {BASE_URL}")
-        else:
-            print(f"✅ Initial fetch returned {resp.status_code} for {BASE_URL}")
-        base_referer = str(resp.url)
-        # Log cookie names and values for debugging
-        cookie_items = scraper.cookies.get_dict()
-        print("🔐 Initial cookies fetched (dict):", cookie_items)
-        # Check specifically for Cloudflare clearance token
-        if "cf_clearance" in cookie_items:
-            print("🟢 cf_clearance cookie present.")
-        else:
-            print("⚠️ cf_clearance cookie not present (Cloudflare JS challenge may remain).")
-        # Log a tiny bit of the response for diagnosis
-        text_snippet = (resp.text or "")[:1200]
-        print("🔍 Initial HTML snippet (first 1200 chars):\n", text_snippet)
+        # call scraper.get in executor to avoid blocking event loop
+        resp = await loop.run_in_executor(None, lambda: scraper.get(BASE_URL, timeout=15))
+        print("🔀 Lifespan initial fetch:", resp.status_code, "->", BASE_URL)
+        # update referer from the resolved URL (in case of redirects)
+        last_referer = str(resp.url) if hasattr(resp, "url") else BASE_URL
+        # log current cookies
+        try:
+            print("🔐 Initial cookies fetched (dict):", scraper.cookies.get_dict())
+        except Exception:
+            print("🔐 Could not read scraper cookies (unexpected).")
     except Exception as e:
-        print(f"❌ Error during initial fetch: {e}")
+        print("❗ Lifespan initial fetch error (non-fatal):", e)
 
     yield
 
-    # Shutdown: nothing special to do for cloudscraper, but be explicit
+    # shutdown
     try:
-        if scraper:
-            scraper.close()
-            print("🧹 cloudscraper closed")
+        if httpx_client:
+            await httpx_client.aclose()
     except Exception:
         pass
 
 
+# Create FastAPI app with lifespan
 app = FastAPI(
-    title="AnimeUnity Proxy (cloudscraper + debug)",
-    description="Proxy that uses cloudscraper to bypass Cloudflare; verbose debug logging for <archivio> parsing.",
-    version="4.0.0",
-    lifespan=lifespan
+    title="AnimeUnity Proxy (cloudscraper + httpx streaming)",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
-# --- Helper functions with verbose logging ---
-
-def debug_print_response(resp, note: str = ""):
-    """Print useful debug info from a requests.Response returned by cloudscraper."""
-    try:
-        print(f"\n--- DEBUG RESPONSE {note} ---")
-        print("URL:", getattr(resp, "url", None))
-        print("Status:", getattr(resp, "status_code", None))
-        print("Headers (first lines):")
-        for k, v in list(getattr(resp, "headers", {}).items())[:6]:
-            print(f"  {k}: {v}")
-        print("Cookies (dict):", scraper.cookies.get_dict() if scraper else {})
-        snippet = (resp.text or "")[:1200]
-        print("HTML snippet (first 1200 chars):")
-        print(snippet)
-        print(f"--- END DEBUG RESPONSE {note} ---\n")
-    except Exception as e:
-        print("Error printing debug response:", e)
-
+# --- Utilities / Parsers ---
 
 def extract_json_from_html_with_thumbnails(html_content: str) -> list:
-    """Extract JSON-like data from the <archivio> tag and clean custom escapes. Verbose debug logs."""
+    """
+    Parse the <archivio records="..."> custom tag that animeunity embeds.
+    This mirrors your original function; it's permissive and returns [] on error.
+    """
     try:
-        print("🔍 Debug: HTML snippet for parsing (first 1200 chars):")
-        print(html_content[:1200].replace("\n", " "))
+        # naive extraction: find <archivio ... records="(json)"> or similar
+        # We'll search for archivio tag and records attribute
+        import re
+        m = re.search(r'<archivio[^>]*records="([^"]+)"', html_content)
+        if not m:
+            # fallback: try finding archivio and attribute extraction via parsing
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html_content, "html.parser")
+            archivio = soup.find("archivio")
+            if not archivio:
+                return []
+            records_string = archivio.get("records") or ""
+        else:
+            records_string = m.group(1)
 
-        soup = BeautifulSoup(html_content, "html.parser")
-        archivio_tag = soup.find("archivio")
-
-        if not archivio_tag:
-            print("⚠️ No <archivio> tag found in HTML.")
-            # Helpful debug outputs
-            # 1) Look for obvious Cloudflare challenge markers:
-            if "Checking your browser" in html_content or "cf_chl_jschl" in html_content or "captcha" in html_content.lower():
-                print("⚠️ The returned page contains Cloudflare challenge markers (Checking your browser / captcha / cf_chl_jschl).")
-            # 2) Print the top-level tags to inspect what was returned
-            top_tags = [tag.name for tag in soup.find_all(limit=20)]
-            print("🔍 Top-level tags in returned HTML (first 20):", top_tags)
-            # 3) Print a larger snippet of the full soup for manual inspection
-            print("🔍 Full HTML (first 5000 chars):")
-            print(str(soup)[:5000].replace("\n", " "))
-            return []
-
-        records_string = archivio_tag.get("records")
-        if not records_string:
-            print("⚠️ <archivio> tag found but missing 'records' attribute.")
-            print("🔍 Debug: archivio tag content (full):")
-            print(str(archivio_tag))
-            return []
-
+        # undo known escapes used on the site
         cleaned = records_string.replace(r'\="" \=""', r'\/').replace('=""', r'\"')
-        try:
-            data = json.loads(cleaned)
-            print(f"✅ Parsed {len(data)} anime records successfully.")
-            return data
-        except json.JSONDecodeError as e:
-            print(f"❌ JSON decode error: {e}")
-            print("🔍 Debug: cleaned records string snippet (first 1000 chars):")
-            print(cleaned[:1000])
-            return []
-
-    except Exception as e:
-        print(f"❌ Unexpected error parsing anime records: {e}")
+        # try to JSON decode
+        return json.loads(cleaned)
+    except Exception as exc:
+        print("❌ Error parsing archive JSON:", exc)
         return []
 
 
 def extract_video_url_from_embed_html(html_content: str) -> Optional[str]:
-    match = re.search(r"window\.downloadUrl\s*=\s*'([^']+)'", html_content)
-    return match.group(1) if match else None
-
-
-# --- Synchronous scraper wrappers executed in thread pool ---
-
-async def fetch_response(url: str, referer: Optional[str] = None, headers: Optional[dict] = None):
     """
-    Use cloudscraper to GET the URL in a background thread. Returns the requests.Response object.
+    Extract a JS variable like: window.downloadUrl = 'https://...';
     """
-    loop = asyncio.get_event_loop()
-
-    def do_get():
-        # Merge headers if provided (scraper has default headers)
-        kw = {}
-        if headers:
-            kw["headers"] = headers
-        # Provide a referer if given
-        if referer:
-            headers_to_send = dict(scraper.headers)
-            headers_to_send.update({"Referer": referer})
-            if headers:
-                headers_to_send.update(headers)
-            kw["headers"] = headers_to_send
-        return scraper.get(url, timeout=30, **kw)
-
-    resp = await loop.run_in_executor(None, do_get)
-    debug_print_response(resp, note=f"fetch_response -> {url}")
-    return resp
+    m = re.search(r"window\.downloadUrl\s*=\s*'([^']+)'", html_content)
+    if m:
+        return m.group(1)
+    # alternative: maybe the embed returns a raw url in body
+    m2 = re.search(r"(https?://[^\s'\"<>]+(?:mp4|m3u8)[^\s'\"<>]*)", html_content)
+    if m2:
+        return m2.group(1)
+    return None
 
 
-async def fetch_text(url: str, referer: Optional[str] = None, headers: Optional[dict] = None) -> str:
-    resp = await fetch_response(url, referer=referer, headers=headers)
-    return resp.text or ""
+async def run_scraper_get_text(url: str, headers: Optional[dict] = None, timeout: int = 20) -> Dict[str, Any]:
+    """
+    Run scraper.get(url) in executor and return a dict with status_code, text, url, headers, cookies.
+    This ensures we don't block the event loop.
+    """
+    global scraper
+    if not scraper:
+        raise RuntimeError("scraper not initialized")
+
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        # cloudscraper uses requests.Session; call it synchronously here
+        resp = scraper.get(url, headers=headers or {}, timeout=timeout)
+        return {
+            "status_code": resp.status_code,
+            "text": resp.text,
+            "url": str(resp.url) if hasattr(resp, "url") else url,
+            "headers": dict(resp.headers),
+            "cookies": scraper.cookies.get_dict(),
+        }
+
+    # run in default executor
+    return await loop.run_in_executor(None, _call)
 
 
-async def fetch_json(url: str, referer: Optional[str] = None, headers: Optional[dict] = None) -> dict:
-    resp = await fetch_response(url, referer=referer, headers=headers)
-    try:
-        return resp.json()
-    except Exception as e:
-        print("❌ Error decoding JSON response:", e)
-        # Log snippet in case the server returned HTML instead
-        print("🔍 Non-JSON response snippet:", (resp.text or "")[:800])
-        raise
+async def run_scraper_get_json(url: str, headers: Optional[dict] = None, timeout: int = 20) -> Dict[str, Any]:
+    """
+    Run scraper.get(url).json() in executor. Return a dict wrapper with 'status_code' and 'json'.
+    """
+    global scraper
+    if not scraper:
+        raise RuntimeError("scraper not initialized")
+
+    loop = asyncio.get_running_loop()
+
+    def _call():
+        resp = scraper.get(url, headers=headers or {}, timeout=timeout)
+        return {
+            "status_code": resp.status_code,
+            "json": resp.json() if resp.status_code == 200 else {},
+            "url": str(resp.url) if hasattr(resp, "url") else url,
+            "headers": dict(resp.headers),
+            "cookies": scraper.cookies.get_dict(),
+        }
+
+    return await loop.run_in_executor(None, _call)
 
 
-# --- Utility to build browser-like headers for specific requests ---
-def build_headers(referer: Optional[str] = None, origin: Optional[str] = None, mobile: bool = True) -> dict:
-    ua = USER_AGENT_MOBILE if mobile else USER_AGENT_DESKTOP
-    h = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+async def simple_retry_scraper_text(url: str, referer: Optional[str] = None, retries: int = 3) -> Dict[str, Any]:
+    """
+    Try to fetch text via cloudscraper with retries. Update last_referer on success.
+    """
+    global last_referer, scraper_lock
+    headers = {
+        "User-Agent": scraper.headers.get("User-Agent") if scraper and hasattr(scraper, "headers") else None,
     }
+    # Set Referer if given
     if referer:
-        h["Referer"] = referer
-    if origin:
-        h["Origin"] = origin
-    return h
+        headers["Referer"] = referer
+    for attempt in range(1, retries + 1):
+        result = await run_scraper_get_text(url, headers=headers)
+        status = result["status_code"]
+        # If response looks like Cloudflare challenge (status 403 and JS page), cloudscraper may need another request.
+        if status == 200:
+            # update referer
+            last_referer = result.get("url", last_referer)
+            return result
+        else:
+            # log debugging snippet for the caller
+            print(f"⚠️ fetch attempt {attempt} -> {url} returned {status}")
+            # If challenge is present, allow cloudscraper another attempt after a short sleep
+            await asyncio.sleep(RETRY_DELAY)
+    return result  # return last result even if non-200
 
 
-# --- API Endpoints ---
+async def simple_retry_scraper_json(url: str, referer: Optional[str] = None, retries: int = 3) -> Dict[str, Any]:
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    for attempt in range(1, retries + 1):
+        result = await run_scraper_get_json(url, headers=headers)
+        status = result["status_code"]
+        if status == 200:
+            # update referer
+            global last_referer
+            last_referer = result.get("url", last_referer)
+            return result
+        else:
+            print(f"⚠️ fetch-json attempt {attempt} -> {url} returned {status}")
+            await asyncio.sleep(RETRY_DELAY)
+    return result
 
 
-@app.get("/search", summary="Search for anime by title query (includes thumbnails)")
+# --- Endpoints using cloudscraper for site/API access ---
+
+
+@app.get("/search", summary="Search for anime by title query (uses cloudscraper)")
 async def search_anime(title: str):
     if not title:
-        raise HTTPException(status_code=400, detail="Title query must be provided.")
+        raise HTTPException(status_code=400, detail="Title is required")
+    safe = quote(title)
+    url = f"{BASE_URL}/archivio?title={safe}"
 
-    global base_referer
-    safe_title = quote(title)
-    search_url = f"{BASE_URL}/archivio?title={safe_title}"
+    # ensure only one initial handshake runs at a time to avoid racing the JS challenge
+    async with scraper_lock:
+        res = await simple_retry_scraper_text(url, referer=last_referer, retries=MAX_RETRIES)
 
-    print(f"\n➡️ /search called with title={title!r}, search_url={search_url}")
-    # Use current referer if available
-    headers = build_headers(referer=base_referer, origin=BASE_URL, mobile=True)
+    # debug info
+    print("➡️ /search called", "status:", res["status_code"], "url:", url)
+    print("🍪 Current scraper cookies:", res.get("cookies"))
 
-    try:
-        resp = await fetch_response(search_url, referer=base_referer, headers=headers)
-        # If Cloudflare returns 403 or a challenge, fetch_response logged it
-        if resp.status_code == 403:
-            # try alternate UA (desktop) once more
-            print("⚠️ Received 403 on search; retrying with desktop UA")
-            headers2 = build_headers(referer=base_referer, origin=BASE_URL, mobile=False)
-            resp = await fetch_response(search_url, referer=base_referer, headers=headers2)
+    if res["status_code"] != 200:
+        # return remote status to client; helpful to see 403/5xx reasons
+        raise HTTPException(status_code=res["status_code"], detail=f"Upstream returned {res['status_code']}")
 
-        html = resp.text or ""
-        # Update referer to the actual response URL (helps mimic browser navigation)
-        base_referer = str(resp.url)
+    html = res["text"]
+    records = extract_json_from_html_with_thumbnails(html)
+    if not records:
+        # If no records found it's possible Cloudflare challenge page returned despite 200 (rare)
+        # Return the HTML snippet for debugging (trim to safe length)
+        snippet = html[:2000]
+        print("🔍 Debug HTML snippet (first 2000 chars):\n", snippet)
+        # Return 502 to indicate upstream parsing issue
+        raise HTTPException(status_code=502, detail="Failed to parse archive records from upstream HTML")
 
-        # Log cookies currently stored
-        print("🍪 Current session cookies:", scraper.cookies.get_dict())
-
-        anime_records = extract_json_from_html_with_thumbnails(html)
-        return [
+    # map the records to expected response shape
+    out = []
+    for r in records:
+        out.append(
             {
                 "id": r.get("id"),
                 "title_en": r.get("title_eng", r.get("title")),
@@ -270,161 +262,181 @@ async def search_anime(title: str):
                 "studio": r.get("studio"),
                 "slug": r.get("slug"),
                 "plot": (r.get("plot") or "").strip(),
-                "genres": [g.get("name") for g in r.get("genres", [])],
+                "genres": [g.get("name") for g in r.get("genres", [])] if r.get("genres") else [],
                 "thumbnail": r.get("imageurl"),
             }
-            for r in anime_records
-        ]
+        )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("❌ /search fatal error:", e)
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+    return out
 
 
-@app.get("/episodes", summary="Get episodes for a specific anime ID")
+@app.get("/episodes", summary="Get episodes for a specific anime ID (uses cloudscraper)")
 async def get_episodes(anime_id: int):
-    global base_referer
-    info_url = f"{BASE_URL}/info_api/{anime_id}/0"
-    print(f"\n➡️ /episodes called for anime_id={anime_id}, url={info_url}")
-    headers = build_headers(referer=base_referer, origin=BASE_URL, mobile=True)
-    try:
-        info_resp = await fetch_response(info_url, referer=base_referer, headers=headers)
-        if info_resp.status_code == 403:
-            print("⚠️ Received 403 on info_api; retrying with desktop UA")
-            info_resp = await fetch_response(info_url, referer=base_referer, headers=build_headers(referer=base_referer, origin=BASE_URL, mobile=False))
+    url_info = f"{BASE_URL}/info_api/{anime_id}/0"
+    # get info (json)
+    async with scraper_lock:
+        res = await simple_retry_scraper_json(url_info, referer=last_referer, retries=MAX_RETRIES)
 
-        base_referer = str(info_resp.url)
-        print("🍪 Cookies after info_api:", scraper.cookies.get_dict())
-        info_data = info_resp.json()
-        count = info_data.get("episodes_count", 0)
-        if count == 0:
-            return {"anime_id": anime_id, "episodes": []}
+    print("➡️ /episodes called", "status:", res["status_code"], "url:", url_info)
+    print("🍪 Current scraper cookies:", res.get("cookies"))
 
-        fetch_url_episodes = f"{info_url}?start_range=0&end_range={min(count, 120)}"
-        episodes_resp = await fetch_response(fetch_url_episodes, referer=base_referer, headers=headers)
-        base_referer = str(episodes_resp.url)
-        episodes_data = episodes_resp.json()
-        return {
-            "anime_id": anime_id,
-            "episodes": [
-                {
-                    "episode_id": e.get("id"),
-                    "number": e.get("number"),
-                    "created_at": e.get("created_at"),
-                    "visits": e.get("visite"),
-                    "scws_id": e.get("scws_id"),
-                }
-                for e in episodes_data.get("episodes", [])
-            ],
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("❌ /episodes fatal error:", e)
-        raise HTTPException(status_code=500, detail=f"Failed to get episodes: {e}")
+    if res["status_code"] != 200:
+        raise HTTPException(status_code=res["status_code"], detail=f"Upstream returned {res['status_code']}")
+
+    info = res.get("json", {})
+    count = info.get("episodes_count", 0)
+    if count == 0:
+        return {"anime_id": anime_id, "episodes": []}
+
+    # fetch episodes list (bounded)
+    fetch_url = f"{url_info}?start_range=0&end_range={min(count, 120)}"
+    async with scraper_lock:
+        res2 = await simple_retry_scraper_json(fetch_url, referer=last_referer, retries=MAX_RETRIES)
+
+    if res2["status_code"] != 200:
+        raise HTTPException(status_code=res2["status_code"], detail=f"Upstream returned {res2['status_code']}")
+
+    episodes_data = res2.get("json", {})
+    return {
+        "anime_id": anime_id,
+        "episodes": [
+            {
+                "episode_id": e.get("id"),
+                "number": e.get("number"),
+                "created_at": e.get("created_at"),
+                "visits": e.get("visite"),
+                "scws_id": e.get("scws_id"),
+            }
+            for e in episodes_data.get("episodes", [])
+        ],
+    }
 
 
-@app.get("/stream", summary="Get direct video URL (cached & retried)")
+@app.get("/stream", summary="Get direct video URL (uses cloudscraper & caching)")
 async def get_stream_url(episode_id: int):
-    global base_referer
     now = time.time()
     cached = stream_cache.get(episode_id)
     if cached and now - cached["timestamp"] < CACHE_TTL:
         return {"episode_id": episode_id, "stream_url": cached["url"], "cached": True}
 
-    embed_url_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
-    print(f"\n➡️ /stream called for episode_id={episode_id}, url={embed_url_endpoint}")
-    try:
-        embed_resp = await fetch_response(embed_url_endpoint, referer=base_referer, headers=build_headers(referer=base_referer, origin=BASE_URL))
-        if embed_resp.status_code == 403:
-            print("⚠️ Received 403 on embed-url; retrying with desktop UA")
-            embed_resp = await fetch_response(embed_url_endpoint, referer=base_referer, headers=build_headers(referer=base_referer, origin=BASE_URL, mobile=False))
+    embed_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
 
-        # Some endpoints redirect (Location), some return URL in body
-        if embed_resp.status_code in (301, 302) and "location" in embed_resp.headers:
-            embed_target_url = embed_resp.headers.get("location")
-        else:
-            embed_target_url = (embed_resp.text or "").strip()
+    async with scraper_lock:
+        res = await simple_retry_scraper_text(embed_endpoint, referer=last_referer, retries=MAX_RETRIES)
 
-        print("🍪 Cookies while resolving embed:", scraper.cookies.get_dict())
-        if not embed_target_url or not embed_target_url.startswith("http"):
-            print("❌ Invalid embed target URL:", embed_target_url[:200])
-            raise HTTPException(status_code=500, detail="Invalid embed target URL")
+    print("➡️ /stream called", "status:", res["status_code"], "url:", embed_endpoint)
+    print("🍪 Current scraper cookies:", res.get("cookies"))
 
-        video_page_resp = await fetch_response(embed_target_url, referer=embed_url_endpoint, headers=build_headers(referer=embed_url_endpoint, origin=BASE_URL))
-        video_page_resp.raise_for_status()
-        video_url = extract_video_url_from_embed_html(video_page_resp.text)
-        if not video_url:
-            print("❌ No video URL found in embed page. HTML snippet:")
-            print((video_page_resp.text or "")[:1200])
-            raise HTTPException(status_code=404, detail="No video URL found")
+    if res["status_code"] not in (200, 302, 301):
+        raise HTTPException(status_code=res["status_code"], detail=f"Upstream returned {res['status_code']}")
 
-        stream_cache[episode_id] = {"url": video_url, "timestamp": now}
-        base_referer = str(video_page_resp.url)
-        return {"episode_id": episode_id, "stream_url": video_url, "cached": False}
+    # embed_target may be in Location header or in the response body
+    embed_target = None
+    if res["headers"].get("location"):
+        embed_target = res["headers"]["location"]
+    else:
+        # sometimes the endpoint returns a URL in the body
+        embed_target = res["text"].strip()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("❌ /stream fatal error:", e)
-        raise HTTPException(status_code=500, detail=f"Failed to get stream URL: {e}")
+    if not embed_target or not embed_target.startswith("http"):
+        raise HTTPException(status_code=502, detail="Invalid embed target URL from upstream")
+
+    # fetch embed target page (may contain js var with download URL)
+    async with scraper_lock:
+        page = await simple_retry_scraper_text(embed_target, referer=embed_endpoint, retries=MAX_RETRIES)
+
+    if page["status_code"] != 200:
+        raise HTTPException(status_code=page["status_code"], detail=f"Failed to fetch embed page ({page['status_code']})")
+
+    video_url = extract_video_url_from_embed_html(page["text"])
+    if not video_url:
+        raise HTTPException(status_code=404, detail="No video URL found in embed page")
+
+    stream_cache[episode_id] = {"url": video_url, "timestamp": now}
+    # update referer to last fetched page
+    global last_referer
+    last_referer = page.get("url", last_referer)
+
+    return {"episode_id": episode_id, "stream_url": video_url, "cached": False}
 
 
-@app.get("/stream_video", summary="Stream video file (with retries)")
+# --- Streaming (httpx async) endpoint ---
+@app.get("/stream_video", summary="Stream video bytes (async httpx) — uses httpx for streaming")
 async def stream_video(request: Request, episode_id: int):
-    global scraper
-    if not scraper:
-        raise HTTPException(status_code=500, detail="Scraper not initialized")
-
+    # Resolve stream_url via internal /stream (so it runs through cloudscraper)
     try:
-        resp = await get_stream_url(episode_id)
-        stream_url = resp.get("stream_url")
-        if not stream_url:
-            raise HTTPException(status_code=404, detail="Stream URL not found")
+        data = await get_stream_url(episode_id)
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get stream URL: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to resolve stream URL: {e}")
 
+    stream_url = data.get("stream_url")
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="Stream URL not found")
+
+    # Prepare range header if provided by client
     range_header = request.headers.get("range")
-    range_start, range_end = 0, None
+    headers = {}
     if range_header:
-        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-        if match:
-            range_start = int(match.group(1))
-            range_end = int(match.group(2) or 0) or None
+        headers["Range"] = range_header
 
-    # Synchronous generator that streams via requests (cloudscraper)
-    def sync_stream_gen():
-        hdrs = {}
-        if range_header:
-            hdrs["Range"] = f"bytes={range_start}-" if not range_end else f"bytes={range_start}-{range_end}"
-        # cloudscraper returns a requests.Response that supports iter_content
-        with scraper.get(stream_url, headers=hdrs, stream=True, timeout=30) as r:
-            if r.status_code not in (200, 206):
-                print("❌ Video fetch returned status:", r.status_code)
-                raise HTTPException(status_code=500, detail="Failed to fetch video")
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
+    # Pass any cookies the scraper session may have to httpx (in case video host needs them)
+    cookies: Dict[str, str] = {}
+    try:
+        # scraper.cookies is requests' cookiejar
+        cookies = scraper.cookies.get_dict() if scraper else {}
+    except Exception:
+        cookies = {}
+
+    # Use an async httpx client (from lifespan)
+    async with httpx.AsyncClient(timeout=None) as client:
+        # stream the response from the remote server
+        async with client.stream("GET", stream_url, headers=headers, cookies=cookies) as resp:
+            # If remote server doesn't like our cookies/headers we may get 403/401 etc
+            if resp.status_code not in (200, 206):
+                # raise on non-success so caller sees the upstream status
+                raise HTTPException(status_code=resp.status_code, detail=f"Upstream streaming returned {resp.status_code}")
+
+            # grab content-length for response headers (if present)
+            content_length = resp.headers.get("content-length")
+            content_type = resp.headers.get("content-type", "video/mp4")
+
+            # Build headers to send back to client
+            headers_to_send = {
+                "Content-Type": content_type,
+                "Accept-Ranges": resp.headers.get("Accept-Ranges", "bytes"),
+            }
+            if range_header and content_length:
+                try:
+                    cl = int(content_length)
+                    # parse requested start — Range header format "bytes=start-end"
+                    m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+                    start = int(m.group(1)) if m else 0
+                    end = int(m.group(2)) if m and m.group(2) else cl - 1
+                    headers_to_send["Content-Range"] = f"bytes {start}-{end}/{cl}"
+                    headers_to_send["Content-Length"] = str(end - start + 1)
+                    status_code = 206
+                except Exception:
+                    headers_to_send["Content-Length"] = content_length
+                    status_code = resp.status_code if resp.status_code in (200, 206) else 200
+            else:
+                if content_length:
+                    headers_to_send["Content-Length"] = content_length
+                status_code = resp.status_code if resp.status_code in (200, 206) else 200
+
+            async def generator():
+                async for chunk in resp.aiter_bytes(1024 * 1024):
                     yield chunk
 
-    # Determine content-length (best-effort)
+            return StreamingResponse(generator(), headers=headers_to_send, status_code=status_code)
+
+
+# --- Health / Debug endpoint (optional) ---
+@app.get("/_debug_info", summary="Debug: show current cookies & referer (not for production)")
+async def debug_info():
     try:
-        head = scraper.head(stream_url, timeout=20)
-        content_length = int(head.headers.get("content-length", 0))
+        cookies = scraper.cookies.get_dict() if scraper else {}
     except Exception:
-        content_length = 0
-
-    headers_to_send = {"Content-Type": "video/mp4", "Accept-Ranges": "bytes"}
-    if range_header and content_length:
-        end = content_length - 1 if not range_end else range_end
-        headers_to_send["Content-Range"] = f"bytes {range_start}-{end}/{content_length}"
-        headers_to_send["Content-Length"] = str(end - range_start + 1)
-        status_code = 206
-    elif content_length:
-        headers_to_send["Content-Length"] = str(content_length)
-        status_code = 200
-    else:
-        status_code = 200
-
-    return StreamingResponse(sync_stream_gen(), headers=headers_to_send, status_code=status_code)
+        cookies = {}
+    return {"last_referer": last_referer, "cookies": cookies, "stream_cache_keys": list(stream_cache.keys())}
