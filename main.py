@@ -254,32 +254,30 @@ async def stream_video(request: Request, episode_id: int):
 
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
-    upstream_headers = {"Range": range_header} if range_header else {}
+    headers = {"Range": range_header} if range_header else {}
 
     try:
-        async with httpx_client.stream("GET", stream_url, headers=upstream_headers, cookies=cookies, timeout=None) as resp:
+        async with httpx_client.stream(
+            "GET", stream_url, headers=headers, cookies=cookies, timeout=None
+        ) as resp:
             if resp.status_code not in (200, 206):
                 raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
 
-            headers_to_send = {
+            response_headers = {
                 "Content-Type": resp.headers.get("content-type", "video/mp4"),
                 "Accept-Ranges": resp.headers.get("accept-ranges", "bytes"),
                 "Access-Control-Allow-Origin": "*",
             }
-
-            # Only set Content-Length if upstream provides it AND we're not using range
-            if not range_header and resp.headers.get("content-length"):
-                headers_to_send["Content-Length"] = resp.headers["content-length"]
 
             async def generator():
                 try:
                     async for chunk in resp.aiter_bytes(1024 * 1024):
                         yield chunk
                 except httpx.StreamClosed:
-                    # Upstream closed; stop streaming gracefully
+                    # Upstream closed connection early; just stop streaming
                     return
 
-            return StreamingResponse(generator(), headers=headers_to_send, status_code=resp.status_code)
+            return StreamingResponse(generator(), headers=response_headers, status_code=resp.status_code)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
