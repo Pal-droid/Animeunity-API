@@ -247,46 +247,65 @@ async def get_stream_url(episode_id: int):
 
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
+    # 1. Get Upstream URL
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
     if not stream_url:
         raise HTTPException(status_code=404, detail="Stream URL not found")
 
+    # 2. Prepare Request Headers (Forward Range)
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
     headers = {"Range": range_header} if range_header else {}
 
     try:
+        # 3. Stream Request to Upstream
         async with httpx_client.stream(
             "GET", stream_url, headers=headers, cookies=cookies, timeout=None
         ) as resp:
-            if resp.status_code not in (200, 206):
-                raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
+            resp_status = resp.status_code
+            resp_headers = dict(resp.headers)
+            
+            if resp_status not in (200, 206):
+                # Upstream returned an error status code
+                raise HTTPException(status_code=resp_status, detail="Upstream returned error")
 
+            # 4. Prepare Response Headers (Applying Fixes)
             response_headers = {
-                "Content-Type": resp.headers.get("content-type", "video/mp4"),
-                "Accept-Ranges": resp.headers.get("accept-ranges", "bytes"),
+                "Content-Type": resp_headers.get("content-type", "video/mp4"),
+                "Accept-Ranges": resp_headers.get("accept-ranges", "bytes"),
                 "Access-Control-Allow-Origin": "*",
+                
+                # FIX: Prevent download prompt by setting Content-Disposition to 'inline'.
+                # We overwrite whatever the upstream sent.
+                "Content-Disposition": "inline", 
             }
 
+            # FIX: Do NOT forward Content-Length (prevents "Response content shorter" error)
+            # This forces Uvicorn/Starlette to use Transfer-Encoding: chunked.
+            
+            # Forward Content-Range only if it's a Partial Content (206) response
+            if resp_status == 206 and "content-range" in resp_headers:
+                response_headers["Content-Range"] = resp_headers["content-range"]
+
+            # 5. Define the Streaming Generator
             async def generator():
                 try:
+                    # Stream the content in large chunks (1MB)
                     async for chunk in resp.aiter_bytes(1024 * 1024):
                         yield chunk
                 except httpx.StreamClosed:
-                    # Upstream closed connection early; just stop streaming
+                    # Upstream closed connection early; gracefully stop streaming
                     return
 
-            return StreamingResponse(generator(), headers=response_headers, status_code=resp.status_code)
+            # 6. Return the Streaming Response
+            return StreamingResponse(
+                generator(), 
+                headers=response_headers, 
+                status_code=resp_status
+            )
 
     except Exception as e:
+        # 7. Handle Connection/Request Errors
+        # This catches errors during the initial request (e.g., connection refused)
         raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
-
-@app.get("/_debug_info")
-async def debug_info():
-    cookies = scraper.cookies.get_dict() if scraper else {}
-    return {
-        "last_referer": last_referer,
-        "cookies": cookies,
-        "stream_cache_keys": list(stream_cache.keys()),
-    }
