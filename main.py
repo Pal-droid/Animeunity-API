@@ -245,10 +245,9 @@ async def get_stream_url(episode_id: int):
     last_referer = page.get("url", last_referer)
     return {"episode_id": episode_id, "stream_url": video_url, "cached": False}
 
-
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
-    """Proxy MP4 download gracefully"""
+    """Proxy MP4 download gracefully without Content-Length"""
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
     if not stream_url:
@@ -261,11 +260,7 @@ async def stream_video(request: Request, episode_id: int):
             raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
 
         content_type = resp.headers.get("content-type", "video/mp4")
-        content_length = resp.headers.get("content-length")
-
         headers_to_send = {"Content-Type": content_type}
-        if content_length:
-            headers_to_send["Content-Length"] = content_length
 
         async def generator():
             try:
@@ -275,7 +270,6 @@ async def stream_video(request: Request, episode_id: int):
                 return
 
         return StreamingResponse(generator(), headers=headers_to_send)
-
 
 @app.get("/_debug_info")
 async def debug_info():
