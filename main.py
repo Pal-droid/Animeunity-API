@@ -297,6 +297,7 @@ async def stream_video(request: Request, episode_id: int):
                     # The Content-Range header is MANDATORY for a 206 response to work.
                     response_headers["Content-Range"] = content_range
                 else:
+                     print(f"❌ UPSTREAM ERROR: Status 206 but MISSING 'Content-Range' header from: {stream_url}")
                     # If the upstream is 206 but missing Content-Range, the player will break.
                     # We can't fix a broken upstream, but this pinpoints the issue.
                     print("ERROR: Upstream returned 206 but missing Content-Range header!")
