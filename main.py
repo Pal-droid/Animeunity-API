@@ -11,7 +11,7 @@ import httpx
 from typing import Optional, Dict, Any
 
 # --- Configuration ---
-BASE_URL = "https://www.animeunity.so"
+BASE_URL = "https://corsproxy.io/?url=https://www.animeunity.so"
 CACHE_TTL = 300  # seconds for stream URL cache
 MAX_RETRIES = 3
 RETRY_DELAY = 1.0  # seconds
