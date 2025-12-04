@@ -70,17 +70,13 @@ app = FastAPI(
 # --- Utilities ---
 
 def extract_json_from_html_with_thumbnails(html_content: str) -> list:
-    """Extract anime JSON records from archive HTML (handles HTML-escaped JSON)"""
     try:
         soup = BeautifulSoup(html_content, "html.parser")
         archivio = soup.find("archivio")
         if not archivio:
             return []
-
         records_string = archivio.get("records") or ""
-        # Unescape HTML entities like &quot; -> "
         records_string = html.unescape(records_string)
-        # Parse JSON
         return json.loads(records_string)
     except Exception as exc:
         print("❌ Error parsing archive JSON:", exc)
@@ -88,7 +84,6 @@ def extract_json_from_html_with_thumbnails(html_content: str) -> list:
 
 
 def extract_video_url_from_embed_html(html_content: str) -> Optional[str]:
-    """Find video or m3u8 URL from embed HTML"""
     m = re.search(r"window\.downloadUrl\s*=\s*'([^']+)'", html_content)
     if m:
         return m.group(1)
@@ -99,7 +94,6 @@ def extract_video_url_from_embed_html(html_content: str) -> Optional[str]:
 
 
 async def run_scraper_get(url: str, as_json: bool = False, referer: Optional[str] = None, timeout: int = 20) -> Dict[str, Any]:
-    """Generic cloudscraper GET via thread executor"""
     global scraper, last_referer
 
     def _call():
@@ -132,7 +126,6 @@ async def run_scraper_get(url: str, as_json: bool = False, referer: Optional[str
 
 
 async def retry_scraper(url: str, as_json: bool = False, referer: Optional[str] = None, retries: int = MAX_RETRIES):
-    """Retry wrapper for scraper requests"""
     for attempt in range(1, retries + 1):
         res = await run_scraper_get(url, as_json=as_json, referer=referer)
         if res["status"] == 200:
@@ -146,7 +139,6 @@ async def retry_scraper(url: str, as_json: bool = False, referer: Optional[str] 
 
 @app.get("/search")
 async def search_anime(title: str):
-    """Search anime by title"""
     if not title:
         raise HTTPException(status_code=400, detail="Missing title")
     safe = quote(title)
@@ -184,7 +176,6 @@ async def search_anime(title: str):
 
 @app.get("/episodes")
 async def get_episodes(anime_id: int):
-    """Fetch episodes list for an anime"""
     url = f"{BASE_URL}/info_api/{anime_id}/0"
     async with scraper_lock:
         res = await retry_scraper(url, as_json=True, referer=last_referer)
@@ -222,7 +213,6 @@ async def get_episodes(anime_id: int):
 
 @app.get("/stream")
 async def get_stream_url(episode_id: int):
-    """Fetch and cache video stream URL (non-streaming)"""
     global last_referer
     now = time.time()
     cached = stream_cache.get(episode_id)
@@ -258,49 +248,33 @@ async def get_stream_url(episode_id: int):
 
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
-    """Proxy actual video stream using httpx"""
+    """Proxy MP4 download gracefully"""
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
     if not stream_url:
         raise HTTPException(status_code=404, detail="Stream URL not found")
 
-    range_header = request.headers.get("range")
-    headers = {"Range": range_header} if range_header else {}
     cookies = scraper.cookies.get_dict() if scraper else {}
 
-    async with httpx_client.stream("GET", stream_url, headers=headers, cookies=cookies) as resp:
-        if resp.status_code not in (200, 206):
-            raise HTTPException(status_code=resp.status_code, detail=f"Upstream returned {resp.status_code}")
+    async with httpx_client.stream("GET", stream_url, cookies=cookies) as resp:
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
 
-        content_length = resp.headers.get("content-length")
         content_type = resp.headers.get("content-type", "video/mp4")
-        headers_to_send = {
-            "Content-Type": content_type,
-            "Accept-Ranges": resp.headers.get("Accept-Ranges", "bytes"),
-        }
+        content_length = resp.headers.get("content-length")
 
-        if range_header and content_length:
-            try:
-                cl = int(content_length)
-                m = re.match(r"bytes=(\d+)-(\d*)", range_header)
-                start = int(m.group(1)) if m else 0
-                end = int(m.group(2)) if m and m.group(2) else cl - 1
-                headers_to_send["Content-Range"] = f"bytes {start}-{end}/{cl}"
-                headers_to_send["Content-Length"] = str(end - start + 1)
-                status_code = 206
-            except Exception:
-                headers_to_send["Content-Length"] = content_length
-                status_code = resp.status_code
-        else:
-            if content_length:
-                headers_to_send["Content-Length"] = content_length
-            status_code = resp.status_code
+        headers_to_send = {"Content-Type": content_type}
+        if content_length:
+            headers_to_send["Content-Length"] = content_length
 
         async def generator():
-            async for chunk in resp.aiter_bytes(1024 * 1024):
-                yield chunk
+            try:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    yield chunk
+            except httpx.StreamClosed:
+                return
 
-        return StreamingResponse(generator(), headers=headers_to_send, status_code=status_code)
+        return StreamingResponse(generator(), headers=headers_to_send)
 
 
 @app.get("/_debug_info")
