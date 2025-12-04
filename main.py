@@ -247,29 +247,29 @@ async def get_stream_url(episode_id: int):
 
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
-    """Proxy MP4 download gracefully without Content-Length"""
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
     if not stream_url:
         raise HTTPException(status_code=404, detail="Stream URL not found")
 
+    range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
 
-    async with httpx_client.stream("GET", stream_url, cookies=cookies) as resp:
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
+    async with httpx_client.stream("GET", stream_url, headers={"Range": range_header} if range_header else {}, cookies=cookies) as resp:
+        if resp.status_code not in (200, 206):
+            raise HTTPException(status_code=resp.status_code)
 
-        content_type = resp.headers.get("content-type", "video/mp4")
-        headers_to_send = {"Content-Type": content_type}
+        headers_to_send = {
+            "Content-Type": resp.headers.get("content-type", "video/mp4"),
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+        }
 
         async def generator():
-            try:
-                async for chunk in resp.aiter_bytes(1024 * 1024):
-                    yield chunk
-            except httpx.StreamClosed:
-                return
+            async for chunk in resp.aiter_bytes(1024 * 1024):
+                yield chunk
 
-        return StreamingResponse(generator(), headers=headers_to_send)
+        return StreamingResponse(generator(), headers=headers_to_send, status_code=resp.status_code)
 
 @app.get("/_debug_info")
 async def debug_info():
