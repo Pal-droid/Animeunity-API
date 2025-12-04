@@ -253,12 +253,13 @@ async def stream_video(request: Request, episode_id: int):
     if not stream_url:
         raise HTTPException(status_code=404, detail="Stream URL not found")
 
-    # 2. Prepare Request Headers (Forward Range for seeking)
+    # 2. Prepare Request Headers
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
     headers = {"Range": range_header} if range_header else {}
     
-    # Add any other required headers (e.g., User-Agent, Referer) here if needed
+    # Optional: Add common headers like User-Agent to mimic a real client
+    # headers["User-Agent"] = "Mozilla/5.0 (compatible; MyStreamProxy/1.0)"
 
     try:
         # 3. Request the Stream from Upstream
@@ -266,44 +267,50 @@ async def stream_video(request: Request, episode_id: int):
             "GET", stream_url, headers=headers, cookies=cookies, timeout=None
         ) as resp:
             resp_status = resp.status_code
-            resp_headers = dict(resp.headers)
             
-            # Check for upstream errors
             if resp_status not in (200, 206):
                 raise HTTPException(status_code=resp_status, detail="Upstream returned error")
 
+            # httpx headers are case-insensitive/normalized, use .get() for reliable extraction
+            resp_headers = resp.headers 
+            
             # 4. Prepare Response Headers (Applying streaming and playback fixes)
             response_headers = {
-                # FIX 1 & 2: Set the Content-Type and Accept-Ranges. 
-                # Accept-Ranges is essential for video player seeking.
+                # Ensure a valid Content-Type is set, defaulting to mp4
                 "Content-Type": resp_headers.get("content-type", "video/mp4"),
+                
+                # Accept-Ranges is critical for seeking
                 "Accept-Ranges": resp_headers.get("accept-ranges", "bytes"),
                 
-                # Allow embedding on other domains
+                # Allow embedding
                 "Access-Control-Allow-Origin": "*",
                 
-                # FIX 3: Force the browser to play instead of downloading.
+                # Force browser to play (prevents download)
                 "Content-Disposition": "inline", 
             }
 
-            # CRITICAL FIX: Do NOT forward Content-Length 
-            # This prevents the "Response content shorter than Content-Length" RuntimeError 
-            # and forces the use of **Transfer-Encoding: chunked**, which is safer for proxies.
-            
-            # Handle Partial Content (206) headers
+            # CRITICAL FIX: Transfer Content-Range only for 206 responses
             if resp_status == 206:
-                # Content-Range is mandatory for 206 responses
-                if "content-range" in resp_headers:
-                    response_headers["Content-Range"] = resp_headers["content-range"]
+                content_range = resp_headers.get("content-range")
+                if content_range:
+                    # The Content-Range header is MANDATORY for a 206 response to work.
+                    response_headers["Content-Range"] = content_range
+                else:
+                    # If the upstream is 206 but missing Content-Range, the player will break.
+                    # We can't fix a broken upstream, but this pinpoints the issue.
+                    print("ERROR: Upstream returned 206 but missing Content-Range header!")
+                    # You might choose to raise an error here if you want to fail hard
+                    # raise HTTPException(status_code=500, detail="Upstream Range response malformed")
+
+            # CRITICAL FIX: Do NOT forward Content-Length 
+            # This prevents the "Response content shorter than Content-Length" RuntimeError.
 
             # 5. Define the Streaming Generator
             async def generator():
                 try:
-                    # Stream the content in 1MB chunks
                     async for chunk in resp.aiter_bytes(1024 * 1024):
                         yield chunk
-                except httpx.StreamClosed:
-                    # Gracefully handle the upstream connection closing early
+                except StreamClosed:
                     return
 
             # 6. Return the Streaming Response
@@ -314,5 +321,5 @@ async def stream_video(request: Request, episode_id: int):
             )
 
     except Exception as e:
-        # 7. Handle catastrophic connection/request errors (e.g., DNS error, timeout)
+        # 7. Handle catastrophic connection/request errors
         raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
