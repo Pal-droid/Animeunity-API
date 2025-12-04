@@ -256,7 +256,7 @@ async def get_stream_url(episode_id: int):
     return {"episode_id": episode_id, "stream_url": video_url, "cached": False}
 
 
-@app.get("/stream_video")
+@app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
     """Proxy actual video stream using httpx"""
     data = await get_stream_url(episode_id)
