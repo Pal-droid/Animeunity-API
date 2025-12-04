@@ -247,7 +247,6 @@ async def get_stream_url(episode_id: int):
 
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
-    # Get actual video URL
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
     if not stream_url:
@@ -255,8 +254,6 @@ async def stream_video(request: Request, episode_id: int):
 
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
-
-    # Prepare headers for upstream request
     upstream_headers = {"Range": range_header} if range_header else {}
 
     try:
@@ -264,46 +261,28 @@ async def stream_video(request: Request, episode_id: int):
             if resp.status_code not in (200, 206):
                 raise HTTPException(status_code=resp.status_code, detail="Upstream returned error")
 
-            # Determine total content length
-            content_length = resp.headers.get("content-length")
-            content_type = resp.headers.get("content-type", "video/mp4")
-            accept_ranges = resp.headers.get("accept-ranges", "bytes")
-
             headers_to_send = {
-                "Content-Type": content_type,
-                "Accept-Ranges": accept_ranges,
+                "Content-Type": resp.headers.get("content-type", "video/mp4"),
+                "Accept-Ranges": resp.headers.get("accept-ranges", "bytes", "bytes"),
                 "Access-Control-Allow-Origin": "*",
             }
 
-            # Handle Range header for browser seeking
-            status_code = resp.status_code
-            if range_header and content_length:
-                total = int(content_length)
-                m = re.match(r"bytes=(\d+)-(\d*)", range_header)
-                start = int(m.group(1)) if m else 0
-                end = int(m.group(2)) if m and m.group(2) else total - 1
-                headers_to_send["Content-Range"] = f"bytes {start}-{end}/{total}"
-                headers_to_send["Content-Length"] = str(end - start + 1)
-                status_code = 206
-            else:
-                if content_length:
-                    headers_to_send["Content-Length"] = content_length
+            # Only set Content-Length if upstream provides it AND we're not using range
+            if not range_header and resp.headers.get("content-length"):
+                headers_to_send["Content-Length"] = resp.headers["content-length"]
 
-            # Generator to stream video chunks
             async def generator():
                 try:
                     async for chunk in resp.aiter_bytes(1024 * 1024):
                         yield chunk
                 except httpx.StreamClosed:
-                    # Stream closed upstream, stop gracefully
+                    # Upstream closed; stop streaming gracefully
                     return
 
-            return StreamingResponse(generator(), headers=headers_to_send, status_code=status_code)
+            return StreamingResponse(generator(), headers=headers_to_send, status_code=resp.status_code)
 
-    except httpx.StreamClosed:
-        raise HTTPException(status_code=502, detail="Upstream stream closed unexpectedly")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
 
 @app.get("/_debug_info")
 async def debug_info():
