@@ -8,6 +8,7 @@ import re
 import time
 import cloudscraper
 import httpx
+from httpx import StreamClosed
 from typing import Optional, Dict, Any
 import html
 from bs4 import BeautifulSoup
