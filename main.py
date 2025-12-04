@@ -9,6 +9,8 @@ import time
 import cloudscraper
 import httpx
 from typing import Optional, Dict, Any
+import html
+from bs4 import BeautifulSoup
 
 # --- Configuration ---
 BASE_URL = "https://corsproxy.io/?url=https://www.animeunity.so"
@@ -68,20 +70,18 @@ app = FastAPI(
 # --- Utilities ---
 
 def extract_json_from_html_with_thumbnails(html_content: str) -> list:
-    """Extract anime JSON records from archive HTML"""
+    """Extract anime JSON records from archive HTML (handles HTML-escaped JSON)"""
     try:
-        m = re.search(r'<archivio[^>]*records="([^"]+)"', html_content)
-        if not m:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html_content, "html.parser")
-            archivio = soup.find("archivio")
-            if not archivio:
-                return []
-            records_string = archivio.get("records") or ""
-        else:
-            records_string = m.group(1)
-        cleaned = records_string.replace(r'\="" \=""', r'\/').replace('=""', r'\"')
-        return json.loads(cleaned)
+        soup = BeautifulSoup(html_content, "html.parser")
+        archivio = soup.find("archivio")
+        if not archivio:
+            return []
+
+        records_string = archivio.get("records") or ""
+        # Unescape HTML entities like &quot; -> "
+        records_string = html.unescape(records_string)
+        # Parse JSON
+        return json.loads(records_string)
     except Exception as exc:
         print("❌ Error parsing archive JSON:", exc)
         return []
@@ -158,8 +158,8 @@ async def search_anime(title: str):
     if res["status"] != 200:
         raise HTTPException(status_code=res["status"], detail="Upstream error")
 
-    html = res["text"]
-    records = extract_json_from_html_with_thumbnails(html)
+    html_content = res["text"]
+    records = extract_json_from_html_with_thumbnails(html_content)
     if not records:
         raise HTTPException(status_code=502, detail="Failed to parse archive records")
 
