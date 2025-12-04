@@ -263,7 +263,7 @@ async def stream_video(request: Request, episode_id: int):
 
             headers_to_send = {
                 "Content-Type": resp.headers.get("content-type", "video/mp4"),
-                "Accept-Ranges": resp.headers.get("accept-ranges", "bytes", "bytes"),
+                "Accept-Ranges": resp.headers.get("accept-ranges", "bytes"),
                 "Access-Control-Allow-Origin": "*",
             }
 
