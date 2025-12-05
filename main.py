@@ -257,54 +257,105 @@ async def stream_video(request: Request, episode_id: int):
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
 
-    headers = {}
+    # Build initial headers (may include Range)
+    upstream_headers = {}
     if range_header:
-        headers["Range"] = range_header
+        upstream_headers["Range"] = range_header
 
     try:
+        # First attempt: request with the client's Range (if provided)
         async with httpx_client.stream(
-            "GET", stream_url, headers=headers, cookies=cookies, timeout=None
+            "GET", stream_url, headers=upstream_headers, cookies=cookies, timeout=None
         ) as upstream:
 
             status = upstream.status_code
             h = upstream.headers
 
-            # ------------------------------
-            # FIX: Normalize broken upstream
-            # ------------------------------
-            # Upstream returns 206 but missing Content-Range
-            # -> Convert to a clean 200 OK
+            # If upstream returned 206 but DID NOT provide Content-Range,
+            # treat upstream as broken and re-request WITHOUT Range to get a clean 200.
             if status == 206 and "content-range" not in h:
-                status = 200
-                range_header = None  # Remove range request
-                print("⚠️ Upstream returned broken 206 — normalizing to 200")
+                # close this upstream context and re-request without Range
+                print("⚠️ Upstream returned 206 without Content-Range — re-requesting without Range")
+                # exiting the "async with" will close the connection; do it by finishing the block
+                pass  # fallthrough to re-request below
 
-            # Base headers
+            else:
+                # Normal happy path: upstream provided either 200, or 206+Content-Range
+                response_headers = {
+                    "Content-Type": h.get("content-type", "video/mp4"),
+                    "Accept-Ranges": "bytes",
+                    "Access-Control-Allow-Origin": "*",
+                    "Content-Disposition": "inline",
+                }
+                if status == 206 and "content-range" in h:
+                    response_headers["Content-Range"] = h["content-range"]
+
+                # Never forward Content-Length (avoid mismatches)
+                response_headers.pop("content-length", None)
+
+                async def chunk_generator():
+                    try:
+                        async for chunk in upstream.aiter_bytes(1024 * 1024):
+                            yield chunk
+                    except httpx.StreamClosed:
+                        # Upstream closed early — stop streaming cleanly
+                        print("⚠️ Upstream closed connection during streaming (stream closed).")
+                        return
+                    except Exception as exc:
+                        # Any other error: log and stop silently to avoid TaskGroup crash
+                        print("⚠️ Streaming error while iterating upstream:", exc)
+                        return
+
+                return StreamingResponse(
+                    chunk_generator(),
+                    status_code=status,
+                    headers=response_headers,
+                )
+
+        # If we reach here it means we exited the first async with due to the broken 206 case.
+        # Re-request without the Range header to get a full 200 response.
+        async with httpx_client.stream(
+            "GET", stream_url, headers={}, cookies=cookies, timeout=None
+        ) as upstream2:
+            status2 = upstream2.status_code
+            h2 = upstream2.headers
+
+            if status2 not in (200, 206):
+                raise HTTPException(status_code=status2, detail="Upstream returned error on re-request")
+
             response_headers = {
-                "Content-Type": h.get("content-type", "video/mp4"),
+                "Content-Type": h2.get("content-type", "video/mp4"),
                 "Accept-Ranges": "bytes",
                 "Access-Control-Allow-Origin": "*",
                 "Content-Disposition": "inline",
             }
 
-            # Only forward Content-Range if valid
-            if status == 206 and "content-range" in h:
-                response_headers["Content-Range"] = h["content-range"]
+            # If the re-request somehow gives a proper 206+Content-Range, forward it
+            if status2 == 206 and "content-range" in h2:
+                response_headers["Content-Range"] = h2["content-range"]
 
-            # Never forward Content-Length
-            if "content-length" in response_headers:
-                del response_headers["content-length"]
+            response_headers.pop("content-length", None)
 
-            # Stream chunks
-            async def chunk_generator():
-                async for chunk in upstream.aiter_bytes(1024 * 1024):
-                    yield chunk
+            async def chunk_generator2():
+                try:
+                    async for chunk in upstream2.aiter_bytes(1024 * 1024):
+                        yield chunk
+                except httpx.StreamClosed:
+                    print("⚠️ Upstream closed connection during streaming (stream closed) on re-request.")
+                    return
+                except Exception as exc:
+                    print("⚠️ Streaming error while iterating upstream on re-request:", exc)
+                    return
 
             return StreamingResponse(
-                chunk_generator(),
-                status_code=status,
+                chunk_generator2(),
+                status_code=status2,
                 headers=response_headers,
             )
 
+    except httpx.RequestError as e:
+        # network-level errors (DNS, connect, etc.)
+        raise HTTPException(status_code=502, detail=f"Upstream request error: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Streaming error: {str(e)}")
+        # Fallback
+        raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
