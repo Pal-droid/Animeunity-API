@@ -248,69 +248,63 @@ async def get_stream_url(episode_id: int):
 
 @app.get("/embed")
 async def stream_video(request: Request, episode_id: int):
-    # 1. Fetch cached or fresh upstream stream URL
     data = await get_stream_url(episode_id)
     stream_url = data.get("stream_url")
+
     if not stream_url:
         raise HTTPException(status_code=404, detail="Stream URL not found")
 
-    # 2. Prepare range + cookies for upstream
     range_header = request.headers.get("range")
     cookies = scraper.cookies.get_dict() if scraper else {}
-    headers = {"Range": range_header} if range_header else {}
+
+    headers = {}
+    if range_header:
+        headers["Range"] = range_header
 
     try:
-        # 3. STREAM the upstream MP4
         async with httpx_client.stream(
             "GET", stream_url, headers=headers, cookies=cookies, timeout=None
-        ) as resp:
+        ) as upstream:
 
-            upstream_status = resp.status_code
-            if upstream_status not in (200, 206):
-                raise HTTPException(status_code=upstream_status, detail="Upstream returned error")
+            status = upstream.status_code
+            h = upstream.headers
 
-            h = resp.headers  # upstream headers
+            # ------------------------------
+            # FIX: Normalize broken upstream
+            # ------------------------------
+            # Upstream returns 206 but missing Content-Range
+            # -> Convert to a clean 200 OK
+            if status == 206 and "content-range" not in h:
+                status = 200
+                range_header = None  # Remove range request
+                print("⚠️ Upstream returned broken 206 — normalizing to 200")
 
-            # 4. Build safe headers for the browser
-            # NOTE: We REMOVE Content-Disposition from upstream completely.
-            # Browsers "download" only because this header is set to attachment.
+            # Base headers
             response_headers = {
-                "Content-Type": "video/mp4",
+                "Content-Type": h.get("content-type", "video/mp4"),
                 "Accept-Ranges": "bytes",
                 "Access-Control-Allow-Origin": "*",
-                
-                # 🔥 CRITICAL FIX:
-                # Force browser to stream inline instead of download
                 "Content-Disposition": "inline",
             }
 
-            # Forward Content-Range only when upstream returns 206
-            if upstream_status == 206:
-                if "content-range" in h:
-                    response_headers["Content-Range"] = h["content-range"]
-                else:
-                    # Upstream is broken if 206 but no Content-Range
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Upstream sent 206 without Content-Range"
-                    )
+            # Only forward Content-Range if valid
+            if status == 206 and "content-range" in h:
+                response_headers["Content-Range"] = h["content-range"]
 
-            # DO NOT FORWARD CONTENT-LENGTH — prevents chunk mismatch crashes
+            # Never forward Content-Length
+            if "content-length" in response_headers:
+                del response_headers["content-length"]
 
-            # 5. Generator that streams upstream chunks
-            async def stream_chunks():
-                try:
-                    async for chunk in resp.aiter_bytes(1024 * 1024):
-                        yield chunk
-                except StreamClosed:
-                    return
+            # Stream chunks
+            async def chunk_generator():
+                async for chunk in upstream.aiter_bytes(1024 * 1024):
+                    yield chunk
 
-            # 6. Return as proper video stream
             return StreamingResponse(
-                stream_chunks(),
-                status_code=upstream_status,
+                chunk_generator(),
+                status_code=status,
                 headers=response_headers,
             )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Streaming error: {e}")
+        raise HTTPException(status_code=500, detail=f"Streaming error: {str(e)}")
