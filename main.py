@@ -99,7 +99,7 @@ def extract_json_from_html_with_thumbnails(html_content: str) -> list:
         if not archivio:
             return []
         records_string = archivio.get("records") or ""
-        records_string = html.unescape(records_string)
+        
         return json.loads(records_string)
     except Exception as exc:
         print("❌ Error parsing archive JSON:", exc)
