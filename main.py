@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from urllib.parse import quote
+import urllib
 import asyncio
 import json
 import re
@@ -196,10 +197,12 @@ async def search_anime(title: str):
         for r in records
     ]
 
-
 @app.get("/episodes")
 async def get_episodes(anime_id: int):
+    # 1. Get the initial count
+    # We use the proxy directly for the base call
     url = f"{BASE_URL}/info_api/{anime_id}/0"
+    
     async with scraper_lock:
         res = await retry_scraper(url, as_json=True, referer=last_referer)
 
@@ -208,10 +211,20 @@ async def get_episodes(anime_id: int):
 
     info = res.get("json", {})
     count = info.get("episodes_count", 0)
+    
     if count == 0:
         return {"anime_id": anime_id, "episodes": []}
 
-    fetch_url = f"{url}?start_range=0&end_range={min(count, 120)}"
+    # 2. Build the second URL with proper encoding
+    # We construct the REAL target URL first (without the proxy)
+    target_api_url = f"https://www.animeunity.so/info_api/{anime_id}/0?start_range=0&end_range={min(count, 120)}"
+    
+    # Percent-encode the entire target URL so '?' and '&' are safe
+    encoded_target = urllib.parse.quote(target_api_url, safe='')
+    
+    # Re-attach to the proxy
+    fetch_url = f"https://corsproxy.io/?url={encoded_target}"
+
     async with scraper_lock:
         res2 = await retry_scraper(fetch_url, as_json=True, referer=last_referer)
 
@@ -219,6 +232,8 @@ async def get_episodes(anime_id: int):
         raise HTTPException(status_code=res2["status"], detail="Upstream error")
 
     data = res2.get("json", {})
+    
+    # 3. Format and return data
     return {
         "anime_id": anime_id,
         "episodes": [
@@ -226,13 +241,12 @@ async def get_episodes(anime_id: int):
                 "episode_id": e.get("id"),
                 "number": e.get("number"),
                 "created_at": e.get("created_at"),
-                "visits": e.get("visite"),
+                "visits": e.get("visite"), # Keeping original 'visite' key from site
                 "scws_id": e.get("scws_id"),
             }
             for e in data.get("episodes", [])
         ],
     }
-
 
 @app.get("/stream")
 async def get_stream_url(episode_id: int):
