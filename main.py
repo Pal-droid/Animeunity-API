@@ -182,6 +182,7 @@ async def search_anime(title: str):
     return [
         {
             "id": r.get("id"),
+            "anilist_id": r.get("anilist_id"),
             "title_en": r.get("title_eng", r.get("title")),
             "title_it": r.get("title_it", r.get("title")),
             "type": r.get("type"),
